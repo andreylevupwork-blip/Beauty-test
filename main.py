@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, Router, types
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery
+from aiogram.exceptions import TelegramUnauthorizedError
+
+from config import settings
+from db import create_appointment, init_db, is_slot_taken
+from keyboards import (
+    kb_booking_entry,
+    kb_masters,
+    kb_confirm,
+    kb_services,
+    kb_weekdays,
+    kb_times,
+)
+from states import Booking
+
+
+router = Router()
+
+
+def _parse_hhmm(hhmm: str) -> tuple[int, int]:
+    hh, mm = hhmm.split(":")
+    return int(hh), int(mm)
+
+
+def _get_tz(tz_name: str) -> ZoneInfo:
+    # On some Windows setups tzdata isn't installed, so certain IANA zones
+    # (like Europe/Kyiv) may be missing. We fallback to UTC to keep booking working.
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _format_date_ua(d: datetime) -> str:
+    # dd.mm.yyyy
+    return d.strftime("%d.%m.%Y")
+
+
+async def _send_start_content(message: types.Message | CallbackQuery.message):
+    await message.answer(settings.content["greeting"])
+    await message.answer(settings.content["prices_message"])
+    await message.answer("Щоб записатися — натисніть кнопку:", reply_markup=kb_booking_entry())
+
+
+async def _available_times_for_date(appt_date, master_name: str) -> list[str]:
+    booking = settings.content["booking"]
+    tz_name = booking.get("timezone") or settings.content.get("timezone") or "Europe/Kyiv"
+    tz_name = settings.tz_override or tz_name
+    tz = _get_tz(tz_name)
+
+    work_start_h, work_start_m = _parse_hhmm(booking["work_start"])
+    work_end_h, work_end_m = _parse_hhmm(booking["work_end"])
+    step_minutes = int(booking["slot_minutes"])
+
+    now = datetime.now(tz)
+
+    times: list[str] = []
+    cursor = datetime(
+        appt_date.year,
+        appt_date.month,
+        appt_date.day,
+        work_start_h,
+        work_start_m,
+        tzinfo=tz,
+    )
+    end_dt = datetime(
+        appt_date.year,
+        appt_date.month,
+        appt_date.day,
+        work_end_h,
+        work_end_m,
+        tzinfo=tz,
+    )
+
+    # Generate slot starts where start + step <= end.
+    while cursor + timedelta(minutes=step_minutes) <= end_dt:
+        # Skip past times (only for today).
+        if cursor < now and cursor.date() == now.date():
+            cursor += timedelta(minutes=step_minutes)
+            continue
+
+        slot_iso = cursor.replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+        if not await is_slot_taken(master_name, slot_iso):
+            times.append(slot_iso)
+        cursor += timedelta(minutes=step_minutes)
+    return times
+
+
+@router.message(CommandStart())
+async def start_handler(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_start_content(message)
+
+
+@router.callback_query(lambda c: c.data == "book:start")
+async def book_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(Booking.service)
+    await callback.answer()
+    await callback.message.answer(
+        "Оберіть послугу:",
+        reply_markup=kb_services(settings.content["services"]),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("service:"))
+async def service_pick_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    data = callback.data.split(":", 1)[1]
+    service = next((s for s in settings.content["services"] if s["id"] == data), None)
+    if not service:
+        await callback.answer("Невідома послуга")
+        return
+
+    await state.update_data(service_id=service["id"], service_title=service["title"])
+    await state.set_state(Booking.master)
+    await callback.answer()
+
+    master_name = settings.content["master_name"]
+    await callback.message.answer(
+        "Оберіть майстра:",
+        reply_markup=kb_masters(master_name),
+    )
+
+
+@router.callback_query(lambda c: c.data == "master:choose")
+async def master_choose_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(master_name=settings.content["master_name"])
+    await state.set_state(Booking.day)
+    await callback.answer()
+    await callback.message.answer("Оберіть день:", reply_markup=kb_weekdays())
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("daywd:"))
+async def day_pick_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    idx = int(callback.data.split(":", 1)[1])
+    booking = settings.content["booking"]
+    tz_name = settings.tz_override or booking.get("timezone") or "Europe/Kyiv"
+    tz = _get_tz(tz_name)
+
+    today = datetime.now(tz).date()
+    # Python weekday: Mon=0 .. Sun=6
+    offset = (idx - today.weekday()) % 7
+    appt_date = today + timedelta(days=offset)
+
+    await callback.answer()
+    fsm_data = await state.get_data()
+    master_name = fsm_data.get("master_name") or settings.content["master_name"]
+    times = await _available_times_for_date(appt_date, master_name)
+    if not times:
+        await callback.message.answer(
+            "На цей день немає доступних слотів. Оберіть інший день.",
+            reply_markup=kb_weekdays(),
+        )
+        return
+
+    await state.update_data(appt_date=appt_date.isoformat())
+    await state.set_state(Booking.time)
+    await callback.message.answer(
+        f"Вільний час на {appt_date.strftime('%d.%m.%Y')}:",
+        reply_markup=kb_times(times_iso=times),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("time:"))
+async def time_pick_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    appt_start_iso = callback.data.split(":", 1)[1]
+    await state.update_data(appt_start_iso=appt_start_iso)
+    await state.set_state(Booking.name)
+    await callback.answer()
+    await callback.message.answer("Вкажіть, будь ласка, ім'я:")
+
+
+@router.message(Booking.name)
+async def name_input_handler(message: types.Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    await state.update_data(name=name)
+    await state.set_state(Booking.phone)
+    await message.answer("Тепер телефон (наприклад +380...):")
+
+
+@router.message(Booking.phone)
+async def phone_input_handler(message: types.Message, state: FSMContext) -> None:
+    phone = message.text.strip()
+    await state.update_data(phone=phone)
+    await state.set_state(Booking.note)
+    await message.answer(
+        "Коментар (не обов'язково). Якщо не треба — напишіть «Пропустити»."
+    )
+
+
+@router.message(Booking.note)
+async def note_input_handler(message: types.Message, state: FSMContext) -> None:
+    note_raw = message.text.strip()
+    note = None if note_raw.lower() in {"пропустити", "skip"} else note_raw
+    await state.update_data(note=note)
+    await state.set_state(Booking.confirm)
+
+    data = await state.get_data()
+    appt_start_iso = data["appt_start_iso"]
+    appt_dt = datetime.fromisoformat(appt_start_iso)
+
+    service_title = data["service_title"]
+    master_name = data["master_name"]
+    appt_date_str = data["appt_date"]
+    appt_time = appt_dt.strftime("%H:%M")
+
+    summary = (
+        "Заявка:\n"
+        f"Послуга: {service_title}\n"
+        f"Майстер: {master_name}\n"
+        f"Дата: {datetime.fromisoformat(appt_date_str).strftime('%d.%m.%Y')}\n"
+        f"Час: {appt_time}\n"
+        f"Ім'я: {data['name']}\n"
+        f"Телефон: {data['phone']}\n"
+    )
+    if data.get("note"):
+        summary += f"Коментар: {data['note']}\n"
+
+    await message.answer(summary + "\n" + settings.content["confirm_text"], reply_markup=kb_confirm())
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("confirm:"))
+async def confirm_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    user_id = str(callback.from_user.id)
+    username = callback.from_user.username
+
+    if action == "no":
+        await callback.answer()
+        await state.set_state(Booking.day)
+        await callback.message.answer("Оберіть інший день:", reply_markup=kb_weekdays())
+        return
+
+    try:
+        appt_id = await create_appointment(
+            user_id=user_id,
+            username=username,
+            name=data["name"],
+            phone=data["phone"],
+            service_id=data["service_id"],
+            service_title=data["service_title"],
+            master_name=data["master_name"],
+            appt_start_iso=data["appt_start_iso"],
+            note=data.get("note"),
+        )
+    except Exception:
+        # Most likely double-booking unique constraint.
+        await callback.answer()
+        await state.set_state(Booking.time)
+        await callback.message.answer(
+            "Вибраний час щойно зайняли. Оберіть інший слот:",
+        )
+
+        # Rebuild times for stored date.
+        appt_date = datetime.fromisoformat(data["appt_date"]).date()
+        times = await _available_times_for_date(appt_date, settings.content["master_name"])
+        if times:
+            await callback.message.answer(
+                f"Вільний час на {appt_date.strftime('%d.%m.%Y')}:",
+                reply_markup=kb_times(times_iso=times),
+            )
+        else:
+            await callback.message.answer("Немає доступних слотів на цей день.", reply_markup=kb_weekdays())
+        return
+
+    await callback.answer()
+    await state.clear()
+
+    appt_dt = datetime.fromisoformat(data["appt_start_iso"])
+    booking_message = (
+        f"✅ Дякуємо! Заявку №{appt_id} прийнято.\n"
+        f"Дата: {appt_dt.strftime('%d.%m.%Y')}\n"
+        f"Час: {appt_dt.strftime('%H:%M')}\n\n"
+        "Бажаємо вам вдалого манікюру!"
+    )
+    await callback.message.answer(booking_message)
+
+    # Notify admin.
+    admin_chat_id = settings.admin_chat_id
+    if admin_chat_id:
+        summary = (
+            "Нова заявка:\n"
+            f"ID: {appt_id}\n"
+            f"Користувач: @{username or callback.from_user.full_name} ({user_id})\n"
+            f"Послуга: {data['service_title']}\n"
+            f"Майстер: {data['master_name']}\n"
+            f"Дата: {datetime.fromisoformat(data['appt_date']).strftime('%d.%m.%Y')}\n"
+            f"Час: {appt_dt.strftime('%H:%M')}\n"
+            f"Ім'я: {data['name']}\n"
+            f"Телефон: {data['phone']}\n"
+        )
+        if data.get("note"):
+            summary += f"Коментар: {data['note']}\n"
+        await callback.bot.send_message(admin_chat_id, summary)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("back:"))
+async def back_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    target = callback.data.split(":", 1)[1]
+    await callback.answer()
+
+    if target == "main":
+        await state.clear()
+        await _send_start_content(callback.message)
+        return
+
+    if target == "services":
+        await state.set_state(Booking.service)
+        await callback.message.answer(
+            "Оберіть послугу:",
+            reply_markup=kb_services(settings.content["services"]),
+        )
+        return
+
+    if target == "prices":
+        await state.clear()
+        await callback.message.answer(settings.content["prices_message"], reply_markup=kb_booking_entry())
+        return
+
+    if target == "day":
+        await state.set_state(Booking.day)
+        await callback.message.answer("Оберіть день:", reply_markup=kb_weekdays())
+        return
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("aiogram").setLevel(logging.INFO)
+
+    await init_db()
+
+    bot = Bot(token=settings.bot_token)
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    try:
+        # Webhook scaffolding (optional). Polling is default.
+        if settings.mode == "webhook" and settings.webhook_base_url:
+            from aiohttp import web
+            from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+
+            webhook_url = f"{settings.webhook_base_url}{settings.webhook_path}"
+            webhook_app = web.Application()
+
+            request_handler = SimpleRequestHandler(
+                dispatcher=dp,
+                bot=bot,
+            )
+            request_handler.register(webhook_app, path=settings.webhook_path)
+
+            # Start app and set webhook.
+            async def on_startup(_app: web.Application) -> None:
+                await bot.set_webhook(webhook_url)
+
+            webhook_app.on_startup.append(on_startup)
+
+            print(f"Webhook enabled at {webhook_url}")
+            web.run_app(
+                webhook_app,
+                host=settings.webhook_host,
+                port=settings.webhook_port,
+            )
+            return
+
+        # If webhook was previously enabled, polling won't receive updates.
+        print("Polling mode: starting bot...")
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    except TelegramUnauthorizedError:
+        print(
+            "ERROR: BOT_TOKEN is invalid (Telegram: Unauthorized).\n"
+            "Open BotFather, copy your bot API token, and paste it into bot/.env:\n"
+            "BOT_TOKEN=YOUR_TOKEN_HERE"
+        )
+        raise
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+

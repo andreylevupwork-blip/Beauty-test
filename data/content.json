@@ -1,0 +1,17 @@
+{
+  "greeting": "Ласкаво просимо! З радістю підберемо час для вашого ідеального манікюру ✨",
+  "prices_message": "Прайс:\n\n1) Манікюр — 1000 грн\n2) Педикюр — 1000 грн\n\nОберіть послугу та зручний час для запису.",
+  "master_name": "Крістіна",
+  "services": [
+    { "id": "manicure", "title": "Манікюр", "price": 1000 },
+    { "id": "pedicure", "title": "Педикюр", "price": 1000 }
+  ],
+  "booking": {
+    "timezone": "Europe/Kyiv",
+    "work_start": "10:00",
+    "work_end": "19:00",
+    "slot_minutes": 60,
+    "days_ahead": 7
+  },
+  "confirm_text": "Підтвердити заявку?"
+}
