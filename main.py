@@ -411,6 +411,19 @@ async def back_handler(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
 
+@router.message()
+async def fallback_message_handler(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_start_content(message)
+
+
+@router.callback_query()
+async def fallback_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await _send_start_content(callback)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("aiogram").setLevel(logging.INFO)
