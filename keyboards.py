@@ -19,10 +19,45 @@ def kb_booking_entry() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Записатися на прийом",
+                    text="💅 Записатися на прийом",
                     callback_data="book:start",
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Портфоліо робіт",
+                    callback_data="portfolio:show",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Мої записи / Скасувати запис",
+                    callback_data="my_bookings:show",
+                )
+            ],
+        ]
+    )
+
+
+def kb_user_appointments(appts: list[dict]) -> InlineKeyboardMarkup:
+    from datetime import datetime
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for appt in appts:
+        appt_dt = datetime.fromisoformat(appt["appt_start"])
+        dt_str = appt_dt.strftime("%d.%m о %H:%M")
+        btn_text = f"❌ Скасувати: {appt['service_title']} ({dt_str})"
+        rows.append(
+            [InlineKeyboardButton(text=btn_text, callback_data=f"cancel_appt:{appt['id']}")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_back_to_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back:main")]
         ]
     )
 

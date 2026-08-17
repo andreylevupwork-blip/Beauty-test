@@ -12,14 +12,22 @@ from aiogram.types import CallbackQuery
 from aiogram.exceptions import TelegramUnauthorizedError
 
 from config import settings
-from db import create_appointment, init_db, is_slot_taken
+from db import (
+    cancel_appointment,
+    create_appointment,
+    get_user_appointments,
+    init_db,
+    is_slot_taken,
+)
 from keyboards import (
+    kb_back_to_main,
     kb_booking_entry,
-    kb_masters,
     kb_confirm,
+    kb_masters,
     kb_services,
-    kb_weekdays,
     kb_times,
+    kb_user_appointments,
+    kb_weekdays,
 )
 from states import Booking
 
@@ -47,9 +55,13 @@ def _format_date_ua(d: datetime) -> str:
 
 
 async def _send_start_content(message: types.Message | CallbackQuery.message):
-    await message.answer(settings.content["greeting"])
-    await message.answer(settings.content["prices_message"])
-    await message.answer("Щоб записатися — натисніть кнопку:", reply_markup=kb_booking_entry())
+    text = (
+        f"<b>{settings.content['greeting']}</b>\n\n"
+        f"{settings.content['prices_message']}\n\n"
+        "👇 <b>Щоб записатися — натисніть кнопку нижче:</b>"
+    )
+    msg_obj = message.message if isinstance(message, CallbackQuery) else message
+    await msg_obj.answer(text, parse_mode="HTML", reply_markup=kb_booking_entry())
 
 
 async def _available_times_for_date(appt_date, master_name: str) -> list[str]:
@@ -100,6 +112,71 @@ async def _available_times_for_date(appt_date, master_name: str) -> list[str]:
 async def start_handler(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     await _send_start_content(message)
+
+
+@router.callback_query(lambda c: c.data == "portfolio:show")
+async def portfolio_show_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    text = settings.content.get(
+        "portfolio_text",
+        "🖼 <b>Портфоліо робіт майстра Крістіни</b>\n\nПриклади наших робіт скоро тут!",
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb_back_to_main())
+
+
+@router.callback_query(lambda c: c.data == "my_bookings:show")
+async def my_bookings_show_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    user_id = str(callback.from_user.id)
+    appts = await get_user_appointments(user_id)
+
+    if not appts:
+        await callback.message.answer(
+            "У вас поки немає активних записів.",
+            reply_markup=kb_back_to_main(),
+        )
+        return
+
+    text = "<b>Ваші активні записи:</b>\nНатисніть на кнопку запису нижче, щоб скасувати його:"
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb_user_appointments(appts),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("cancel_appt:"))
+async def cancel_appt_handler(callback: CallbackQuery) -> None:
+    appt_id = int(callback.data.split(":", 1)[1])
+    user_id = str(callback.from_user.id)
+
+    success = await cancel_appointment(appt_id, user_id)
+    if success:
+        await callback.answer("Запис успішно скасовано!", show_alert=True)
+        if settings.admin_chat_id:
+            try:
+                await callback.bot.send_message(
+                    settings.admin_chat_id,
+                    f"❌ <b>Скасування запису №{appt_id}</b>\nКористувач: @{callback.from_user.username or callback.from_user.full_name} ({user_id})",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    else:
+        await callback.answer("Запис не знайдено або вже скасовано.", show_alert=True)
+
+    appts = await get_user_appointments(user_id)
+    if not appts:
+        await callback.message.answer(
+            "У вас більше немає активних записів.",
+            reply_markup=kb_back_to_main(),
+        )
+    else:
+        await callback.message.answer(
+            "<b>Ваші активні записи:</b>",
+            parse_mode="HTML",
+            reply_markup=kb_user_appointments(appts),
+        )
 
 
 @router.callback_query(lambda c: c.data == "book:start")

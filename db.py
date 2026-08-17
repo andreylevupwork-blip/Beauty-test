@@ -94,6 +94,31 @@ async def create_appointment(
                 created_at,
             ),
         )
+async def get_user_appointments(user_id: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT id, service_title, master_name, appt_start, status
+            FROM appointments
+            WHERE user_id = ? AND status = 'confirmed'
+            ORDER BY appt_start ASC
+            """,
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def cancel_appointment(appt_id: int, user_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            DELETE FROM appointments
+            WHERE id = ? AND user_id = ?
+            """,
+            (appt_id, user_id),
+        )
         await db.commit()
-        return int(cursor.lastrowid)
+        return cursor.rowcount > 0
 
