@@ -14,29 +14,61 @@ def kb_main() -> InlineKeyboardMarkup:
     return kb
 
 
-def kb_booking_entry() -> InlineKeyboardMarkup:
+def kb_booking_entry(is_admin: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="💅 Записатися на прийом",
+                callback_data="book:start",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🖼 Портфоліо робіт",
+                callback_data="portfolio:show",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Мої записи / Скасувати запис",
+                callback_data="my_bookings:show",
+            )
+        ],
+    ]
+    if is_admin:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="👑 Адмін-панель",
+                    callback_data="admin:menu",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def kb_admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💅 Записатися на прийом",
-                    callback_data="book:start",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🖼 Портфоліо робіт",
-                    callback_data="portfolio:show",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Мої записи / Скасувати запис",
-                    callback_data="my_bookings:show",
-                )
-            ],
+            [InlineKeyboardButton(text="📋 Всі записи", callback_data="admin:all_appts")],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back:main")],
         ]
     )
+
+
+def kb_admin_all_appts(appts: list[dict]) -> InlineKeyboardMarkup:
+    from datetime import datetime
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for appt in appts:
+        appt_dt = datetime.fromisoformat(appt["appt_start"])
+        dt_str = appt_dt.strftime("%d.%m %H:%M")
+        btn_text = f"🗑 Видалити №{appt['id']} ({appt['name']} — {dt_str})"
+        rows.append(
+            [InlineKeyboardButton(text=btn_text, callback_data=f"admin_delete:{appt['id']}")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в адмін-панель", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_user_appointments(appts: list[dict]) -> InlineKeyboardMarkup:

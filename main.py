@@ -13,13 +13,17 @@ from aiogram.exceptions import TelegramUnauthorizedError
 
 from config import settings
 from db import (
+    admin_delete_appointment,
     cancel_appointment,
     create_appointment,
+    get_all_appointments,
     get_user_appointments,
     init_db,
     is_slot_taken,
 )
 from keyboards import (
+    kb_admin_all_appts,
+    kb_admin_menu,
     kb_back_to_main,
     kb_booking_entry,
     kb_confirm,
@@ -41,8 +45,6 @@ def _parse_hhmm(hhmm: str) -> tuple[int, int]:
 
 
 def _get_tz(tz_name: str) -> ZoneInfo:
-    # On some Windows setups tzdata isn't installed, so certain IANA zones
-    # (like Europe/Kyiv) may be missing. We fallback to UTC to keep booking working.
     try:
         return ZoneInfo(tz_name)
     except Exception:
@@ -50,7 +52,6 @@ def _get_tz(tz_name: str) -> ZoneInfo:
 
 
 def _format_date_ua(d: datetime) -> str:
-    # dd.mm.yyyy
     return d.strftime("%d.%m.%Y")
 
 
@@ -60,8 +61,12 @@ async def _send_start_content(message: types.Message | CallbackQuery.message):
         f"{settings.content['prices_message']}\n\n"
         "👇 <b>Щоб записатися — натисніть кнопку нижче:</b>"
     )
+    user_id = message.from_user.id if message.from_user else None
+    is_admin = bool(
+        settings.admin_chat_id and user_id and int(user_id) == int(settings.admin_chat_id)
+    )
     msg_obj = message.message if isinstance(message, CallbackQuery) else message
-    await msg_obj.answer(text, parse_mode="HTML", reply_markup=kb_booking_entry())
+    await msg_obj.answer(text, parse_mode="HTML", reply_markup=kb_booking_entry(is_admin=is_admin))
 
 
 async def _available_times_for_date(appt_date, master_name: str) -> list[str]:
@@ -176,6 +181,105 @@ async def cancel_appt_handler(callback: CallbackQuery) -> None:
             "<b>Ваші активні записи:</b>",
             parse_mode="HTML",
             reply_markup=kb_user_appointments(appts),
+        )
+
+
+@router.callback_query(lambda c: c.data == "admin:menu")
+async def admin_menu_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    await callback.answer()
+    text = "👑 <b>Панель адміністратора</b>\n\nОберіть потрібну дію:"
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+@router.callback_query(lambda c: c.data == "admin:all_appts")
+async def admin_all_appts_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    await callback.answer()
+    appts = await get_all_appointments()
+
+    if not appts:
+        await callback.message.answer(
+            "📋 <b>Всі записи:</b>\n\nАктивних записів немає.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    lines = ["📋 <b>Всі активні записи клієнтів:</b>\n"]
+    for idx, appt in enumerate(appts, 1):
+        appt_dt = datetime.fromisoformat(appt["appt_start"])
+        dt_str = appt_dt.strftime("%d.%m.%Y о %H:%M")
+        username_str = f" (@{appt['username']})" if appt.get("username") else ""
+        note_str = f"\n   💬 Коментар: {appt['note']}" if appt.get("note") else ""
+        lines.append(
+            f"<b>{idx}) Запис №{appt['id']}</b>\n"
+            f"   👤 Клієнт: {appt['name']}{username_str}\n"
+            f"   📞 Тел: {appt['phone']}\n"
+            f"   💅 Послуга: {appt['service_title']}\n"
+            f"   👩‍🎨 Майстер: {appt['master_name']}\n"
+            f"   📅 Час: <b>{dt_str}</b>{note_str}\n"
+        )
+
+    full_text = "\n".join(lines)
+    await callback.message.answer(
+        full_text,
+        parse_mode="HTML",
+        reply_markup=kb_admin_all_appts(appts),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin_delete:"))
+async def admin_delete_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    appt_id = int(callback.data.split(":", 1)[1])
+    success = await admin_delete_appointment(appt_id)
+
+    if success:
+        await callback.answer(f"Запис №{appt_id} видалено!", show_alert=True)
+    else:
+        await callback.answer("Запис не знайдено або вже видалено.", show_alert=True)
+
+    appts = await get_all_appointments()
+    if not appts:
+        await callback.message.answer(
+            "📋 <b>Всі записи:</b>\n\nАктивних записів більше немає.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+    else:
+        lines = ["📋 <b>Всі активні записи клієнтів:</b>\n"]
+        for idx, appt in enumerate(appts, 1):
+            appt_dt = datetime.fromisoformat(appt["appt_start"])
+            dt_str = appt_dt.strftime("%d.%m.%Y о %H:%M")
+            username_str = f" (@{appt['username']})" if appt.get("username") else ""
+            note_str = f"\n   💬 Коментар: {appt['note']}" if appt.get("note") else ""
+            lines.append(
+                f"<b>{idx}) Запис №{appt['id']}</b>\n"
+                f"   👤 Клієнт: {appt['name']}{username_str}\n"
+                f"   📞 Тел: {appt['phone']}\n"
+                f"   💅 Послуга: {appt['service_title']}\n"
+                f"   👩‍🎨 Майстер: {appt['master_name']}\n"
+                f"   📅 Час: <b>{dt_str}</b>{note_str}\n"
+            )
+
+        full_text = "\n".join(lines)
+        await callback.message.answer(
+            full_text,
+            parse_mode="HTML",
+            reply_markup=kb_admin_all_appts(appts),
         )
 
 
