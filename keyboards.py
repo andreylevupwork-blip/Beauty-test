@@ -14,46 +14,70 @@ def kb_main() -> InlineKeyboardMarkup:
     return kb
 
 
-def kb_booking_entry(is_admin: bool = False) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="💅 Записатися на прийом",
-                callback_data="book:start",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🖼 Портфоліо робіт",
-                callback_data="portfolio:show",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="❌ Мої записи / Скасувати запис",
-                callback_data="my_bookings:show",
-            )
-        ],
-    ]
-    if is_admin:
-        buttons.append(
+def kb_booking_entry() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="👑 Адмін-панель",
-                    callback_data="admin:menu",
+                    text="💅 Записатися на прийом",
+                    callback_data="book:start",
                 )
-            ]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Портфоліо робіт",
+                    callback_data="portfolio:show",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Мої записи / Скасувати запис",
+                    callback_data="my_bookings:show",
+                )
+            ],
+        ]
+    )
 
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Всі записи", callback_data="admin:all_appts")],
-            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back:main")],
+            [InlineKeyboardButton(text="📋 Всі записи клієнтів", callback_data="admin:all_appts")],
+            [InlineKeyboardButton(text="⏰ Управління робочим часом", callback_data="admin:manage_slots_days")],
+            [InlineKeyboardButton(text="👁‍🗨 Тестовий перегляд як клієнт", callback_data="admin:view_as_client")],
         ]
     )
+
+
+def kb_admin_weekdays() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, wd in enumerate(WEEKDAYS_UA_SHORT):
+        rows.append([InlineKeyboardButton(text=wd, callback_data=f"admin_daywd:{idx}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в адмін-панель", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_admin_time_slots(slots_info: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in slots_info:
+        label = s["time_label"]
+        status = s["status"]
+        iso = s["iso"]
+
+        if status == "available":
+            btn_text = f"🟢 {label} — Відкрито (натисніть щоб закрити)"
+            cb = f"admin_toggle_slot:{iso}"
+        elif status == "blocked":
+            btn_text = f"🔴 {label} — Заблоковано (натисніть щоб відкрити)"
+            cb = f"admin_toggle_slot:{iso}"
+        else:
+            btn_text = f"🔒 {label} — Зайнято клієнтом ({s.get('client_name', 'Запис')})"
+            cb = f"admin_delete:{s.get('appt_id')}" if s.get('appt_id') else "ignore"
+
+        rows.append([InlineKeyboardButton(text=btn_text, callback_data=cb)])
+
+    rows.append([InlineKeyboardButton(text="⬅️ Назад до вибору дня", callback_data="admin:manage_slots_days")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_admin_all_appts(appts: list[dict]) -> InlineKeyboardMarkup:

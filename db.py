@@ -35,8 +35,12 @@ async def init_db() -> None:
         # Prevent double-booking for the same master+time.
         await db.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_master_time
-            ON appointments (master_name, appt_start);
+            CREATE TABLE IF NOT EXISTS blocked_slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                master_name TEXT NOT NULL,
+                slot_iso TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
             """
         )
         await db.commit()
@@ -53,8 +57,58 @@ async def is_slot_taken(master_name: str, appt_start_iso: str) -> bool:
             """,
             (master_name, appt_start_iso),
         ) as cur:
-            row = await cur.fetchone()
-            return row is not None
+            if await cur.fetchone() is not None:
+                return True
+
+        async with db.execute(
+            """
+            SELECT 1
+            FROM blocked_slots
+            WHERE master_name = ? AND slot_iso = ?
+            LIMIT 1
+            """,
+            (master_name, appt_start_iso),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def is_slot_blocked(master_name: str, slot_iso: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT 1
+            FROM blocked_slots
+            WHERE master_name = ? AND slot_iso = ?
+            LIMIT 1
+            """,
+            (master_name, slot_iso),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def toggle_slot_block(master_name: str, slot_iso: str) -> bool:
+    created_at = datetime.utcnow().isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM blocked_slots WHERE master_name = ? AND slot_iso = ?",
+            (master_name, slot_iso),
+        ) as cur:
+            exists = await cur.fetchone() is not None
+
+        if exists:
+            await db.execute(
+                "DELETE FROM blocked_slots WHERE master_name = ? AND slot_iso = ?",
+                (master_name, slot_iso),
+            )
+            await db.commit()
+            return False
+        else:
+            await db.execute(
+                "INSERT OR IGNORE INTO blocked_slots (master_name, slot_iso, created_at) VALUES (?, ?, ?)",
+                (master_name, slot_iso, created_at),
+            )
+            await db.commit()
+            return True
 
 
 async def create_appointment(

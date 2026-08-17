@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, Router, types
@@ -19,11 +19,15 @@ from db import (
     get_all_appointments,
     get_user_appointments,
     init_db,
+    is_slot_blocked,
     is_slot_taken,
+    toggle_slot_block,
 )
 from keyboards import (
     kb_admin_all_appts,
     kb_admin_menu,
+    kb_admin_time_slots,
+    kb_admin_weekdays,
     kb_back_to_main,
     kb_booking_entry,
     kb_confirm,
@@ -51,8 +55,26 @@ def _get_tz(tz_name: str) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
-def _format_date_ua(d: datetime) -> str:
+def _format_date_ua(d: datetime | date) -> str:
     return d.strftime("%d.%m.%Y")
+
+
+def _get_date_for_weekday_index(idx: int) -> date:
+    booking = settings.content["booking"]
+    tz_name = settings.tz_override or booking.get("timezone") or "Europe/Kyiv"
+    tz = _get_tz(tz_name)
+    today = datetime.now(tz).date()
+    offset = (idx - today.weekday()) % 7
+    return today + timedelta(days=offset)
+
+
+async def _send_admin_start(message: types.Message | CallbackQuery.message):
+    text = (
+        "👑 <b>Панель адміністратора</b>\n\n"
+        "Вітаємо! Оберіть потрібну дію в меню нижче:"
+    )
+    msg_obj = message.message if isinstance(message, CallbackQuery) else message
+    await msg_obj.answer(text, parse_mode="HTML", reply_markup=kb_admin_menu())
 
 
 async def _send_start_content(message: types.Message | CallbackQuery.message):
@@ -61,12 +83,8 @@ async def _send_start_content(message: types.Message | CallbackQuery.message):
         f"{settings.content['prices_message']}\n\n"
         "👇 <b>Щоб записатися — натисніть кнопку нижче:</b>"
     )
-    user_id = message.from_user.id if message.from_user else None
-    is_admin = bool(
-        settings.admin_chat_id and user_id and int(user_id) == int(settings.admin_chat_id)
-    )
     msg_obj = message.message if isinstance(message, CallbackQuery) else message
-    await msg_obj.answer(text, parse_mode="HTML", reply_markup=kb_booking_entry(is_admin=is_admin))
+    await msg_obj.answer(text, parse_mode="HTML", reply_markup=kb_booking_entry())
 
 
 async def _available_times_for_date(appt_date, master_name: str) -> list[str]:
@@ -113,10 +131,176 @@ async def _available_times_for_date(appt_date, master_name: str) -> list[str]:
     return times
 
 
+async def _generate_all_slots_for_date(appt_date: date, master_name: str) -> list[str]:
+    booking = settings.content["booking"]
+    tz_name = booking.get("timezone") or settings.content.get("timezone") or "Europe/Kyiv"
+    tz_name = settings.tz_override or tz_name
+    tz = _get_tz(tz_name)
+
+    start_h, start_m = _parse_hhmm(booking.get("work_start", "10:00"))
+    end_h, end_m = _parse_hhmm(booking.get("work_end", "19:00"))
+    step_minutes = int(booking.get("slot_minutes", 60))
+
+    cursor = datetime(appt_date.year, appt_date.month, appt_date.day, start_h, start_m, tzinfo=tz)
+    end_dt = datetime(appt_date.year, appt_date.month, appt_date.day, end_h, end_m, tzinfo=tz)
+
+    times = []
+    while cursor + timedelta(minutes=step_minutes) <= end_dt:
+        slot_iso = cursor.replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+        times.append(slot_iso)
+        cursor += timedelta(minutes=step_minutes)
+    return times
+
+
 @router.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext) -> None:
     await state.clear()
-    await _send_start_content(message)
+    user_id = message.from_user.id if message.from_user else None
+    if settings.admin_chat_id and user_id and int(user_id) == int(settings.admin_chat_id):
+        await _send_admin_start(message)
+    else:
+        await _send_start_content(message)
+
+
+@router.callback_query(lambda c: c.data == "admin:menu")
+async def admin_menu_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    await callback.answer()
+    await _send_admin_start(callback.message)
+
+
+@router.callback_query(lambda c: c.data == "admin:view_as_client")
+async def admin_view_as_client_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _send_start_content(callback.message)
+
+
+@router.callback_query(lambda c: c.data == "admin:manage_slots_days")
+async def admin_manage_slots_days_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        "⏰ <b>Управління робочим часом</b>\n\nОберіть день для перегляду та налаштування слотів:",
+        parse_mode="HTML",
+        reply_markup=kb_admin_weekdays(),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin_daywd:"))
+async def admin_day_slots_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    await callback.answer()
+    day_idx = int(callback.data.split(":", 1)[1])
+    target_date = _get_date_for_weekday_index(day_idx)
+    master_name = settings.content["master_name"]
+
+    all_slot_isos = await _generate_all_slots_for_date(target_date, master_name)
+    appts = await get_all_appointments()
+    appts_by_time = {a["appt_start"]: a for a in appts if a["master_name"] == master_name}
+
+    slots_info = []
+    for iso in all_slot_isos:
+        time_label = iso[11:16]
+        if iso in appts_by_time:
+            appt = appts_by_time[iso]
+            slots_info.append({
+                "iso": iso,
+                "time_label": time_label,
+                "status": "booked",
+                "client_name": appt["name"],
+                "appt_id": appt["id"],
+            })
+        elif await is_slot_blocked(master_name, iso):
+            slots_info.append({
+                "iso": iso,
+                "time_label": time_label,
+                "status": "blocked",
+            })
+        else:
+            slots_info.append({
+                "iso": iso,
+                "time_label": time_label,
+                "status": "available",
+            })
+
+    dt_str = _format_date_ua(target_date)
+    text = (
+        f"⏰ <b>Управління слотами на {dt_str}</b>\n\n"
+        "🟢 — Відкрито для запису (натисніть щоб закрити)\n"
+        "🔴 — Заблоковано (натисніть щоб відкрити)\n"
+        "🔒 — Зайнято клієнтом (натисніть щоб видалити)"
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb_admin_time_slots(slots_info))
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin_toggle_slot:"))
+async def admin_toggle_slot_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not (settings.admin_chat_id and int(user_id) == int(settings.admin_chat_id)):
+        await callback.answer("У вас немає прав адміністратора", show_alert=True)
+        return
+
+    slot_iso = callback.data.split(":", 1)[1]
+    master_name = settings.content["master_name"]
+
+    is_blocked = await toggle_slot_block(master_name, slot_iso)
+    time_label = slot_iso[11:16]
+
+    if is_blocked:
+        await callback.answer(f"🔴 Час {time_label} заблоковано для запису", show_alert=True)
+    else:
+        await callback.answer(f"🟢 Час {time_label} відкрито для запису", show_alert=True)
+
+    target_dt = datetime.fromisoformat(slot_iso)
+    all_slot_isos = await _generate_all_slots_for_date(target_dt.date(), master_name)
+    appts = await get_all_appointments()
+    appts_by_time = {a["appt_start"]: a for a in appts if a["master_name"] == master_name}
+
+    slots_info = []
+    for iso in all_slot_isos:
+        lbl = iso[11:16]
+        if iso in appts_by_time:
+            appt = appts_by_time[iso]
+            slots_info.append({
+                "iso": iso,
+                "time_label": lbl,
+                "status": "booked",
+                "client_name": appt["name"],
+                "appt_id": appt["id"],
+            })
+        elif await is_slot_blocked(master_name, iso):
+            slots_info.append({
+                "iso": iso,
+                "time_label": lbl,
+                "status": "blocked",
+            })
+        else:
+            slots_info.append({
+                "iso": iso,
+                "time_label": lbl,
+                "status": "available",
+            })
+
+    dt_str = _format_date_ua(target_dt)
+    text = (
+        f"⏰ <b>Управління слотами на {dt_str}</b>\n\n"
+        "🟢 — Відкрито для запису (натисніть щоб закрити)\n"
+        "🔴 — Заблоковано (натисніть щоб відкрити)\n"
+        "🔒 — Зайнято клієнтом (натисніть щоб видалити)"
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb_admin_time_slots(slots_info))
 
 
 @router.callback_query(lambda c: c.data == "portfolio:show")
@@ -324,14 +508,7 @@ async def master_choose_handler(callback: CallbackQuery, state: FSMContext) -> N
 @router.callback_query(lambda c: c.data and c.data.startswith("daywd:"))
 async def day_pick_handler(callback: CallbackQuery, state: FSMContext) -> None:
     idx = int(callback.data.split(":", 1)[1])
-    booking = settings.content["booking"]
-    tz_name = settings.tz_override or booking.get("timezone") or "Europe/Kyiv"
-    tz = _get_tz(tz_name)
-
-    today = datetime.now(tz).date()
-    # Python weekday: Mon=0 .. Sun=6
-    offset = (idx - today.weekday()) % 7
-    appt_date = today + timedelta(days=offset)
+    appt_date = _get_date_for_weekday_index(idx)
 
     await callback.answer()
     fsm_data = await state.get_data()
